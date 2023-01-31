@@ -190,12 +190,26 @@ struct mass_attacher *mass_attacher__new(struct SKEL_NAME *skel, struct ksyms *k
 void mass_attacher__free(struct mass_attacher *att)
 {
 	int i;
+#ifdef BPF_NO_GLOBAL_DATA
+	int key, global_var_fd;
+	__u64 val;
+#endif
 
 	if (!att)
 		return;
 
-	if (att->skel)
+	if (att->skel) {
+#ifndef BPF_NO_GLOBAL_DATA
 		att->skel->bss->ready = false;
+#else
+		global_var_fd = bpf_map__fd(att->skel->maps.global_var);
+		if (global_var_fd <= 0)
+			return;
+		key = retsnoop_ready;
+		val = false;
+		bpf_map_update_elem(global_var_fd, &key, &val, BPF_ANY);
+#endif
+	}
 
 	btf__free(att->vmlinux_btf);
 
@@ -239,7 +253,6 @@ static bool is_valid_glob(const char *glob)
 		fprintf(stderr, "NULL glob provided.\n");
 		return false;
 	}
-	
 	n = strlen(glob);
 	if (n == 0) {
 		fprintf(stderr, "Empty glob provided.\n");
@@ -330,9 +343,49 @@ static int prepare_func(struct mass_attacher *att, const char *func_name,
 			const struct btf_type *t, int btf_id);
 static int calibrate_features(struct mass_attacher *att);
 
+#ifdef BPF_NO_GLOBAL_DATA
+void mass_attacher_update_global_var(struct mass_attacher *att)
+{
+	int key, global_var_fd;
+	__u64 val;
+
+	global_var_fd = bpf_map__fd(att->skel->maps.global_var);
+	if (global_var_fd <= 0) {
+		fprintf(stderr, "mass_attacher_update_global_var Failed to open map global_var\n");
+		return;
+	}
+
+	key = retsnoop_kret_ip_off;
+	val = att->kret_ip_off;
+	bpf_map_update_elem(global_var_fd, &key, &val, BPF_ANY);
+	//att->skel->rodata->kret_ip_off = att->kret_ip_off;
+
+	key = retsnoop_has_fentry_protection;
+	val = att->has_fentry_protection;
+	bpf_map_update_elem(global_var_fd, &key, &val, BPF_ANY);
+	//att->skel->rodata->has_fentry_protection = att->has_fentry_protection;
+
+	key = retsnoop_has_bpf_get_func_ip;
+	val = att->has_bpf_get_func_ip;
+	bpf_map_update_elem(global_var_fd, &key, &val, BPF_ANY);
+	//att->skel->rodata->has_bpf_get_func_ip = att->has_bpf_get_func_ip;
+
+	key = retsnoop_has_bpf_cookie;
+	val = att->has_bpf_cookie;
+	bpf_map_update_elem(global_var_fd, &key, &val, BPF_ANY);
+	//att->skel->rodata->has_bpf_cookie = att->has_bpf_cookie;
+}
+
+const char *get_path_btf(void);
+
+#endif
+
 int mass_attacher__prepare(struct mass_attacher *att)
 {
 	int err, i, n;
+#ifdef BPF_NO_GLOBAL_DATA
+	const char* path_btf;
+#endif
 
 	/* Load and cache /proc/kallsyms for IP <-> kfunc mapping */
 	att->ksyms = ksyms__load();
@@ -376,10 +429,12 @@ int mass_attacher__prepare(struct mass_attacher *att)
 		}
 	}
 
+#ifndef BPF_NO_GLOBAL_DATA
 	att->skel->rodata->kret_ip_off = att->kret_ip_off;
 	att->skel->rodata->has_fentry_protection = att->has_fentry_protection;
 	att->skel->rodata->has_bpf_get_func_ip = att->has_bpf_get_func_ip;
 	att->skel->rodata->has_bpf_cookie = att->has_bpf_cookie;
+#endif
 
 	/* Load names of possible kprobes */
 	err = load_available_kprobes(att);
@@ -413,10 +468,24 @@ int mass_attacher__prepare(struct mass_attacher *att)
 
 	att->vmlinux_btf = libbpf_find_kernel_btf();
 	err = libbpf_get_error(att->vmlinux_btf);
+#ifndef BPF_NO_GLOBAL_DATA
 	if (err) {
 		fprintf(stderr, "Failed to load vmlinux BTF: %d\n", err);
 		return -EINVAL;
 	}
+#else
+	if (err) {
+		path_btf = get_path_btf();
+		if (path_btf)
+			att->vmlinux_btf = btf__parse(path_btf, NULL);
+
+		err = libbpf_get_error(att->vmlinux_btf);
+		if (err) {
+			fprintf(stderr, "Failed to load vmlinux BTF: %d\n", err);
+			return -EINVAL;
+		}
+	}
+#endif
 
 	n = btf__type_cnt(att->vmlinux_btf);
 	for (i = 1; i < n; i++) {
@@ -505,6 +574,7 @@ int mass_attacher__prepare(struct mass_attacher *att)
 	return 0;
 }
 
+#ifndef BPF_NO_GLOBAL_DATA
 static int calibrate_features(struct mass_attacher *att)
 {
 	struct calib_feat_bpf *calib_skel;
@@ -552,6 +622,86 @@ static int calibrate_features(struct mass_attacher *att)
 	calib_feat_bpf__destroy(calib_skel);
 	return 0;
 }
+#else
+struct bpf_object_open_opts *get_opts_prog(void);
+static int calibrate_features(struct mass_attacher *att)
+{
+	struct calib_feat_bpf *calib_skel;
+	int err;
+	int global_var_fd;
+	int key;
+	__u64 val;
+	__u64 has_bpf_get_func_ip, has_bpf_cookie, has_kprobe_multi, kret_ip_off, has_fexit_sleep_fix, has_fentry_protection;
+
+	calib_skel = calib_feat_bpf__open_opts(get_opts_prog());
+	if (!calib_skel) {
+		fprintf(stderr, "Failed to open feature calibration skeleton\n");
+		return -EFAULT;
+	}
+
+	err = calib_feat_bpf__load(calib_skel);
+	if (err) {
+		fprintf(stderr, "Failed to load feature detection skeleton\n");
+		return -EFAULT;
+	}
+
+	global_var_fd = bpf_map__fd(calib_skel->maps.global_var);
+	if (global_var_fd <= 0) {
+		fprintf(stderr, "calibrate_features Failed to open map global_var\n");
+		return -1;
+	}
+	key = calib_feat_my_tid;
+	val = syscall(SYS_gettid);
+	bpf_map_update_elem(global_var_fd, &key, &val, BPF_ANY);
+
+	err = calib_feat_bpf__attach(calib_skel);
+	if (err) {
+		fprintf(stderr, "Failed to attach feature calibration skeleton\n");
+		calib_feat_bpf__destroy(calib_skel);
+		return -EFAULT;
+	}
+
+	usleep(1);
+
+	key = calib_feat_has_bpf_get_func_ip;
+	bpf_map_lookup_elem(global_var_fd, &key, &has_bpf_get_func_ip);
+	key = calib_feat_has_bpf_cookie;
+	bpf_map_lookup_elem(global_var_fd, &key, &has_bpf_cookie);
+	key = calib_feat_has_kprobe_multi;
+	bpf_map_lookup_elem(global_var_fd, &key, &has_kprobe_multi);
+	key = calib_feat_kret_ip_off;
+	bpf_map_lookup_elem(global_var_fd, &key, &kret_ip_off);
+	key = calib_feat_has_fexit_sleep_fix;
+	bpf_map_lookup_elem(global_var_fd, &key, &has_fexit_sleep_fix);
+	key = calib_feat_has_fentry_protection;
+	bpf_map_lookup_elem(global_var_fd, &key, &has_fentry_protection);
+
+	if (!has_bpf_get_func_ip && kret_ip_off == 0) {
+		fprintf(stderr, "Failed to calibrate kretprobe func IP extraction.\n");
+		return -EFAULT;
+	}
+
+	att->kret_ip_off = kret_ip_off;
+	att->has_bpf_get_func_ip = has_bpf_get_func_ip;
+	att->has_fexit_sleep_fix = has_fexit_sleep_fix;
+	att->has_fentry_protection = has_fentry_protection;
+	att->has_bpf_cookie = has_bpf_cookie;
+	att->has_kprobe_multi = has_kprobe_multi;
+
+	if (att->debug) {
+		printf("Feature calibration results:\n"
+		       "\tkretprobe IP offset: %d\n"
+		       "\tfexit sleep fix: %s\n"
+		       "\tfentry re-entry protection: %s\n",
+		       att->kret_ip_off,
+		       att->has_fexit_sleep_fix ? "yes" : "no",
+		       att->has_fentry_protection ? "yes" : "no");
+	}
+
+	calib_feat_bpf__destroy(calib_skel);
+	return 0;
+}
+#endif
 
 static int prepare_func(struct mass_attacher *att, const char *func_name,
 			const struct btf_type *t, int btf_id)
@@ -859,7 +1009,7 @@ int mass_attacher__attach(struct mass_attacher *att)
 	unsigned long *addrs = NULL;
 	const char **syms = NULL;
 	__u64 *cookies = NULL;
-	int i, err;
+	int i, err, fail_cnt;
 
 	if (att->use_kprobe_multi) {
 		addrs = calloc(att->func_cnt, sizeof(*addrs));
@@ -871,6 +1021,7 @@ int mass_attacher__attach(struct mass_attacher *att)
 		}
 	}
 
+	fail_cnt = 0;
 	for (i = 0; i < att->func_cnt; i++) {
 		struct mass_attacher_func_info *finfo = &att->func_infos[i];
 		const char *func_name = finfo->name, *func_desc = finfo->name;
@@ -922,7 +1073,9 @@ int mass_attacher__attach(struct mass_attacher *att)
 			if (err) {
 				fprintf(stderr, "Failed to attach KPROBE prog for func #%d (%s) at addr %lx: %d\n",
 					i + 1, func_desc, func_addr, err);
-				goto err_out;
+				//goto err_out;
+				fail_cnt++;
+				continue;
 			}
 
 			kprobe_opts.retprobe = true;
@@ -947,6 +1100,10 @@ skip_attach:
 			printf("Attached%s to function #%d '%s'.\n",
 			att->dry_run ? " (dry run)" : "", i + 1, func_desc);
 		}
+	}
+	if (fail_cnt == att->func_cnt) {
+		err = -1;
+		goto err_out;
 	}
 
 	if (!att->dry_run && att->use_kprobe_multi) {
@@ -1013,7 +1170,19 @@ err_out:
 
 void mass_attacher__activate(struct mass_attacher *att)
 {
+#ifndef BPF_NO_GLOBAL_DATA
 	att->skel->bss->ready = true;
+#else
+	int global_var_fd, key;
+	__u64 val;
+
+	global_var_fd = bpf_map__fd(att->skel->maps.global_var);
+	if (global_var_fd <= 0)
+		return;
+	key = retsnoop_ready;
+	val = true;
+	bpf_map_update_elem(global_var_fd, &key, &val, BPF_ANY);
+#endif
 }
 
 struct SKEL_NAME *mass_attacher__skeleton(const struct mass_attacher *att)

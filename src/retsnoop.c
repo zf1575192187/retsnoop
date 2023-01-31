@@ -62,6 +62,9 @@ static struct env {
 	long lbr_flags;
 	int lbr_max_cnt;
 	const char *vmlinux_path;
+#ifdef BPF_NO_GLOBAL_DATA
+	const char *btf_vmlinux_path;
+#endif
 	int pid;
 	int longer_than_ms;
 
@@ -192,6 +195,10 @@ static const struct argp_option opts[] = {
 	  "Emit non-filtered full stack traces" },
 	{ "stacks-map-size", OPT_STACKS_MAP_SIZE, "SIZE", 0,
 	  "Stacks map size (default 4096)" },
+#ifdef BPF_NO_GLOBAL_DATA
+	{ "btf_kernel", 'b',
+	  "PATH", 0, "Path to btf information for target kernel vmlinux" },
+#endif
 	{},
 };
 
@@ -290,6 +297,13 @@ static int parse_lbr_arg(const char *arg)
 
 	return -EINVAL;
 }
+
+#ifdef BPF_NO_GLOBAL_DATA
+const char *get_path_btf(void)
+{
+	return env.btf_vmlinux_path;
+}
+#endif
 
 static error_t parse_arg(int key, char *arg, struct argp_state *state)
 {
@@ -412,6 +426,11 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 	case 'k':
 		env.vmlinux_path = arg;
 		break;
+#ifdef BPF_NO_GLOBAL_DATA
+	case 'b':
+		env.btf_vmlinux_path = arg;
+		break;
+#endif
 	case 'n':
 		if (arg[0] == '@') {
 			err = append_str_file(&env.allow_comms, &env.allow_comm_cnt, arg + 1);
@@ -658,15 +677,31 @@ static bool is_err_in_mask(__u64 *err_mask, int err)
 static bool should_report_stack(struct ctx *ctx, const struct call_stack *s)
 {
 	struct retsnoop_bpf *skel = ctx->skel;
-	int i, id, flags, res;
+	int i, id, res;
 	bool allowed = false;
+#ifndef BPF_NO_GLOBAL_DATA
+	int flags;
+#else
+	int func_flags_fd;
+	__u64 flags;
+#endif
 
 	if (!env.has_error_filter)
 		return true;
 
+#ifdef BPF_NO_GLOBAL_DATA
+	func_flags_fd = bpf_map__fd(skel->maps.func_flags);
+	if (func_flags_fd <= 0)
+		return true;
+#endif
+
 	for (i = 0; i < s->max_depth; i++) {
 		id = s->func_ids[i];
+#ifndef BPF_NO_GLOBAL_DATA
 		flags = skel->bss->func_flags[id];
+#else
+		bpf_map_lookup_elem(func_flags_fd, &id, &flags);
+#endif
 
 		if (flags & FUNC_CANT_FAIL)
 			continue;
@@ -694,7 +729,11 @@ static bool should_report_stack(struct ctx *ctx, const struct call_stack *s)
 
 	for (i = s->saved_depth - 1; i < s->saved_max_depth; i++) {
 		id = s->saved_ids[i];
+#ifndef BPF_NO_GLOBAL_DATA
 		flags = skel->bss->func_flags[id];
+#else
+		bpf_map_lookup_elem(func_flags_fd, &id, &flags);
+#endif
 
 		if (flags & FUNC_CANT_FAIL)
 			continue;
@@ -726,11 +765,26 @@ static int filter_fstack(struct ctx *ctx, struct fstack_item *r, const struct ca
 	struct retsnoop_bpf *skel = ctx->skel;
 	struct fstack_item *fitem;
 	const char *fname;
-	int i, id, flags, cnt;
+	int i, id, cnt;
+#ifndef BPF_NO_GLOBAL_DATA
+	int flags;
+#else
+	__u64 flags;
+	int func_flags_fd;
+
+
+	func_flags_fd = bpf_map__fd(skel->maps.func_flags);
+	if (func_flags_fd <= 0)
+		return 0;
+#endif
 
 	for (i = 0, cnt = 0; i < s->max_depth; i++, cnt++) {
 		id = s->func_ids[i];
+#ifndef BPF_NO_GLOBAL_DATA
 		flags = skel->bss->func_flags[id];
+#else
+		bpf_map_lookup_elem(func_flags_fd, &id, &flags);
+#endif
 		finfo = mass_attacher__func(att, id);
 		fname = finfo->name;
 
@@ -759,7 +813,11 @@ static int filter_fstack(struct ctx *ctx, struct fstack_item *r, const struct ca
 
 	for (i = s->saved_depth - 1; i < s->saved_max_depth; i++, cnt++) {
 		id = s->saved_ids[i];
+#ifndef BPF_NO_GLOBAL_DATA
 		flags = skel->bss->func_flags[id];
+#else
+		bpf_map_lookup_elem(func_flags_fd, &id, &flags);
+#endif
 		finfo = mass_attacher__func(att, id);
 		fname = finfo->name;
 
@@ -1165,6 +1223,14 @@ static void prepare_ft_items(struct ctx *ctx, struct stack_items_cache *cache,
 	struct func_trace *ft;
 	struct func_trace_item *f, *fn;
 	int i, d, last_seq_id = -1;
+#ifdef BPF_NO_GLOBAL_DATA
+	__u64 flags;
+	int func_flags_fd;
+
+	func_flags_fd = bpf_map__fd(ctx->skel->maps.func_flags);
+	if (func_flags_fd <= 0)
+		return;
+#endif
 
 	if (!hashmap__find(func_traces_hash, k, (void **)&ft))
 		return;
@@ -1210,7 +1276,12 @@ static void prepare_ft_items(struct ctx *ctx, struct stack_items_cache *cache,
 
 		if (f->depth < 0) {
 			snappendf(s->dur, "%.3fus", f->func_lat / 1000.0);
+#ifndef BPF_NO_GLOBAL_DATA
 			prepare_func_res(s, f->func_res, ctx->skel->bss->func_flags[f->func_id]);
+#else
+			bpf_map_lookup_elem(func_flags_fd, &f->func_id, &flags);
+			prepare_func_res(s, f->func_res, flags);
+#endif
 		}
 	}
 
@@ -1781,6 +1852,7 @@ static int find_vmlinux(char *path, size_t max_len, bool soft)
 	return -ESRCH;
 }
 
+#ifndef BPF_NO_GLOBAL_DATA
 static int detect_kernel_features(void)
 {
 	struct calib_feat_bpf *skel;
@@ -1838,6 +1910,101 @@ out:
 	return err;
 }
 
+#else
+
+struct bpf_object_open_opts opts_prog;
+
+struct bpf_object_open_opts *get_opts_prog(void)
+{
+	return &opts_prog;
+}
+
+static int detect_kernel_features(void)
+{
+	struct calib_feat_bpf *skel;
+	int err;
+	int global_var_fd;
+	int key;
+	__u64 my_tid;
+	__u64 has_ringbuf, has_bpf_get_func_ip, has_branch_snapshot, has_bpf_cookie, has_kprobe_multi, kret_ip_off, has_fexit_sleep_fix, has_fentry_protection;
+
+	opts_prog.sz = sizeof(struct bpf_object_open_opts);
+	opts_prog.btf_custom_path = env.btf_vmlinux_path;
+	skel = calib_feat_bpf__open_opts(&opts_prog);
+	if (!skel) {
+		fprintf(stderr, "Failed to open feature detection skeleton\n");
+		return -EFAULT;
+	}
+	err = calib_feat_bpf__load(skel);
+	if (err) {
+		fprintf(stderr, "Failed to load feature detection skeleton\n");
+		return -EFAULT;
+	}
+
+	global_var_fd = bpf_map__fd(skel->maps.global_var);
+	if (global_var_fd <= 0) {
+		fprintf(stderr, "detect_kernel_features Failed to open map global_var %d\n", global_var_fd);
+		return -1;
+	}
+	key = calib_feat_my_tid;
+	my_tid = syscall(SYS_gettid);
+	bpf_map_update_elem(global_var_fd, &key, &my_tid, BPF_ANY);
+
+	err = calib_feat_bpf__attach(skel);
+	if (err) {
+		fprintf(stderr, "Failed to attach feature detection skeleton\n");
+		calib_feat_bpf__destroy(skel);
+		return -EFAULT;
+	}
+
+	usleep(1);
+
+	key = calib_feat_has_ringbuf;
+	bpf_map_lookup_elem(global_var_fd, &key, &has_ringbuf);
+	key = calib_feat_has_bpf_get_func_ip;
+	bpf_map_lookup_elem(global_var_fd, &key, &has_bpf_get_func_ip);
+	key = calib_feat_has_branch_snapshot;
+	bpf_map_lookup_elem(global_var_fd, &key, &has_branch_snapshot);
+	key = calib_feat_has_bpf_cookie;
+	bpf_map_lookup_elem(global_var_fd, &key, &has_bpf_cookie);
+	key = calib_feat_has_kprobe_multi;
+	bpf_map_lookup_elem(global_var_fd, &key, &has_kprobe_multi);
+	key = calib_feat_kret_ip_off;
+	bpf_map_lookup_elem(global_var_fd, &key, &kret_ip_off);
+	key = calib_feat_has_fexit_sleep_fix;
+	bpf_map_lookup_elem(global_var_fd, &key, &has_fexit_sleep_fix);
+	key = calib_feat_has_fentry_protection;
+	bpf_map_lookup_elem(global_var_fd, &key, &has_fentry_protection);
+
+	if (env.debug) {
+		printf("Feature detection:\n"
+		       "\tBPF ringbuf map supported: %s\n"
+		       "\tbpf_get_func_ip() supported: %s\n"
+		       "\tbpf_get_branch_snapshot() supported: %s\n"
+		       "\tBPF cookie supported: %s\n"
+		       "\tmulti-attach kprobe supported: %s\n",
+		       has_ringbuf ? "yes" : "no",
+		       has_bpf_get_func_ip ? "yes" : "no",
+		       has_branch_snapshot ? "yes" : "no",
+		       has_bpf_cookie ? "yes" : "no",
+		       has_kprobe_multi ? "yes" : "no");
+		printf("Feature calibration:\n"
+		       "\tkretprobe IP offset: %lld\n"
+		       "\tfexit sleep fix: %s\n"
+		       "\tfentry re-entry protection: %s\n",
+		       kret_ip_off,
+		       has_fexit_sleep_fix ? "yes" : "no",
+		       has_fentry_protection ? "yes" : "no");
+	}
+
+	env.has_ringbuf = has_ringbuf;
+	env.has_branch_snapshot = has_branch_snapshot;
+
+	calib_feat_bpf__destroy(skel);
+	return 0;
+}
+#endif
+
 #define INTEL_FIXED_VLBR_EVENT        0x1b00
 
 static int create_lbr_perf_events(int *fds, int cpu_cnt)
@@ -1890,6 +2057,235 @@ static void sig_handler(int sig)
 	exiting = true;
 }
 
+#ifdef BPF_NO_GLOBAL_DATA
+int update_global_map(struct retsnoop_bpf *skel, struct mass_attacher *att)
+{
+	int global_var_fd, key, space_fd;
+	__u64 val;
+	char spaces[512] = {};
+	char name[MAX_FUNC_NAME_LEN];
+	int func_names_fd, func_ips_fd, func_flags_fd, insn_fmt_fd, n;
+
+	char FMT_SUCC_VOID[]         = "    EXIT  %s%s [VOID]     ";
+	char FMT_SUCC_TRUE[]         = "    EXIT  %s%s [true]     ";
+	char FMT_SUCC_FALSE[]        = "    EXIT  %s%s [false]    ";
+	char FMT_FAIL_NULL[]         = "[!] EXIT  %s%s [NULL]     ";
+	char FMT_FAIL_PTR[]          = "[!] EXIT  %s%s [%d]       ";
+	char FMT_SUCC_PTR[]          = "    EXIT  %s%s [0x%lx]    ";
+	char FMT_FAIL_LONG[]         = "[!] EXIT  %s%s [%ld]      ";
+	char FMT_SUCC_LONG[]         = "    EXIT  %s%s [%ld]      ";
+	char FMT_FAIL_INT[]          = "[!] EXIT  %s%s [%d]       ";
+	char FMT_SUCC_INT[]          = "    EXIT  %s%s [%d]       ";
+
+	char FMT_SUCC_VOID_COMPAT[]  = "    EXIT  [%d] %s [VOID]  ";
+	char FMT_SUCC_TRUE_COMPAT[]  = "    EXIT  [%d] %s [true]  ";
+	char FMT_SUCC_FALSE_COMPAT[] = "    EXIT  [%d] %s [false] ";
+	char FMT_FAIL_NULL_COMPAT[]  = "[!] EXIT  [%d] %s [NULL]  ";
+	char FMT_FAIL_PTR_COMPAT[]   = "[!] EXIT  [%d] %s [%d]    ";
+	char FMT_SUCC_PTR_COMPAT[]   = "    EXIT  [%d] %s [0x%lx] ";
+	char FMT_FAIL_LONG_COMPAT[]  = "[!] EXIT  [%d] %s [%ld]   ";
+	char FMT_SUCC_LONG_COMPAT[]  = "    EXIT  [%d] %s [%ld]   ";
+	char FMT_FAIL_INT_COMPAT[]   = "[!] EXIT  [%d] %s [%d]    ";
+	char FMT_SUCC_INT_COMPAT[]   = "    EXIT  [%d] %s [%d]    ";
+
+	const struct btf *vmlinux_btf = NULL;
+
+	n = mass_attacher__func_cnt(att);
+	vmlinux_btf = mass_attacher__btf(att);
+
+	global_var_fd = bpf_map__fd(skel->maps.global_var);
+	if (global_var_fd <= 0) {
+		fprintf(stderr, "main Failed to open map global_var %d\n",global_var_fd);
+		return -1;
+	}
+
+	key = retsnoop_tgid_allow_cnt;
+	val = env.allow_pid_cnt;
+	bpf_map_update_elem(global_var_fd, &key, &val, BPF_ANY);
+	//skel->rodata->tgid_allow_cnt = env.allow_pid_cnt;
+
+	key = retsnoop_tgid_deny_cnt;
+	val = env.deny_pid_cnt;
+	bpf_map_update_elem(global_var_fd, &key, &val, BPF_ANY);
+	//skel->rodata->tgid_deny_cnt = env.deny_pid_cnt;
+
+	key = retsnoop_comm_allow_cnt;
+	val = env.allow_comm_cnt;
+	bpf_map_update_elem(global_var_fd, &key, &val, BPF_ANY);
+	//skel->rodata->comm_allow_cnt = env.allow_comm_cnt;
+
+	key = retsnoop_comm_deny_cnt;
+	val = env.deny_comm_cnt;
+	bpf_map_update_elem(global_var_fd, &key, &val, BPF_ANY);
+	//skel->rodata->comm_deny_cnt = env.deny_comm_cnt;
+
+	/* turn on extra bpf_printk()'s on BPF side */
+	key = retsnoop_verbose;
+	val = env.bpf_logs;
+	bpf_map_update_elem(global_var_fd, &key, &val, BPF_ANY);
+	//skel->rodata->verbose = env.bpf_logs;
+
+	key = retsnoop_extra_verbose;
+	val = env.debug_extra;
+	bpf_map_update_elem(global_var_fd, &key, &val, BPF_ANY);
+	//skel->rodata->extra_verbose = env.debug_extra;
+
+	key = retsnoop_targ_tgid;
+	val = env.pid;
+	bpf_map_update_elem(global_var_fd, &key, &val, BPF_ANY);
+	//skel->rodata->targ_tgid = env.pid;
+
+	key = retsnoop_emit_success_stacks;
+	val = env.emit_success_stacks;
+	bpf_map_update_elem(global_var_fd, &key, &val, BPF_ANY);
+	//skel->rodata->emit_success_stacks = env.emit_success_stacks;
+
+	key = retsnoop_emit_intermediate_stacks;
+	val = env.emit_intermediate_stacks;
+	bpf_map_update_elem(global_var_fd, &key, &val, BPF_ANY);
+	//skel->rodata->emit_intermediate_stacks = env.emit_intermediate_stacks;
+
+	key = retsnoop_duration_ns;
+	val = env.longer_than_ms * 1000000ULL;
+	bpf_map_update_elem(global_var_fd, &key, &val, BPF_ANY);
+	//skel->rodata->duration_ns = env.longer_than_ms * 1000000ULL;
+
+	//memset(skel->rodata->spaces, ' ', sizeof(skel->rodata->spaces) - 1);
+	space_fd = bpf_map__fd(skel->maps.spaces);
+	if (space_fd <= 0) {
+		fprintf(stderr, "Failed to open map space\n");
+		return -1;
+	}
+	memset(spaces, ' ', sizeof(spaces) - 1);
+	spaces[sizeof(spaces) - 1] = 0;
+	key = 0;
+	bpf_map_update_elem(global_var_fd, &key, spaces, BPF_ANY);
+
+	key = retsnoop_use_ringbuf;
+	val = env.has_ringbuf;
+	bpf_map_update_elem(global_var_fd, &key, &val, BPF_ANY);
+	//skel->rodata->use_ringbuf = env.has_ringbuf;
+
+	key = retsnoop_use_lbr;
+	val = env.use_lbr;
+	bpf_map_update_elem(global_var_fd, &key, &val, BPF_ANY);
+	//skel->rodata->use_lbr = env.use_lbr;
+
+	if (env.emit_func_trace) {
+		key = retsnoop_emit_func_trace;
+		val = true;
+		bpf_map_update_elem(global_var_fd, &key, &val, BPF_ANY);
+		//skel->rodata->emit_func_trace = true;
+	}
+
+	insn_fmt_fd = bpf_map__fd(skel->maps.insn_fmt);
+	if (insn_fmt_fd <= 0) {
+		fprintf(stderr, "Failed to open map insn_fmt\n");
+		return -1;
+	}
+
+	key = FMT_SUCC_VOID_id;
+	bpf_map_update_elem(insn_fmt_fd, &key, &FMT_SUCC_VOID, BPF_ANY);
+	key = FMT_SUCC_TRUE_id;
+	bpf_map_update_elem(insn_fmt_fd, &key, &FMT_SUCC_TRUE, BPF_ANY);
+	key = FMT_SUCC_FALSE_id;
+	bpf_map_update_elem(insn_fmt_fd, &key, &FMT_SUCC_FALSE, BPF_ANY);
+	key = FMT_FAIL_NULL_id;
+	bpf_map_update_elem(insn_fmt_fd, &key, &FMT_FAIL_NULL, BPF_ANY);
+	key = FMT_FAIL_PTR_id;
+	bpf_map_update_elem(insn_fmt_fd, &key, &FMT_FAIL_PTR, BPF_ANY);
+	key = FMT_SUCC_PTR_id;
+	bpf_map_update_elem(insn_fmt_fd, &key, &FMT_SUCC_PTR, BPF_ANY);
+	key = FMT_FAIL_LONG_id;
+	bpf_map_update_elem(insn_fmt_fd, &key, &FMT_FAIL_LONG, BPF_ANY);
+	key = FMT_SUCC_LONG_id;
+	bpf_map_update_elem(insn_fmt_fd, &key, &FMT_SUCC_LONG, BPF_ANY);
+	key = FMT_FAIL_INT_id;
+	bpf_map_update_elem(insn_fmt_fd, &key, &FMT_FAIL_INT, BPF_ANY);
+	key = FMT_SUCC_INT_id;
+	bpf_map_update_elem(insn_fmt_fd, &key, &FMT_SUCC_INT, BPF_ANY);
+
+	key = FMT_SUCC_VOID_COMPAT_id;
+	bpf_map_update_elem(insn_fmt_fd, &key, &FMT_SUCC_VOID_COMPAT, BPF_ANY);
+	key = FMT_SUCC_TRUE_COMPAT_id;
+	bpf_map_update_elem(insn_fmt_fd, &key, &FMT_SUCC_TRUE_COMPAT, BPF_ANY);
+	key = FMT_SUCC_FALSE_COMPAT_id;
+	bpf_map_update_elem(insn_fmt_fd, &key, &FMT_SUCC_FALSE_COMPAT, BPF_ANY);
+	key = FMT_FAIL_NULL_COMPAT_id;
+	bpf_map_update_elem(insn_fmt_fd, &key, &FMT_FAIL_NULL_COMPAT, BPF_ANY);
+	key = FMT_FAIL_PTR_COMPAT_id;
+	bpf_map_update_elem(insn_fmt_fd, &key, &FMT_FAIL_PTR_COMPAT, BPF_ANY);
+	key = FMT_SUCC_PTR_COMPAT_id;
+	bpf_map_update_elem(insn_fmt_fd, &key, &FMT_SUCC_PTR_COMPAT, BPF_ANY);
+	key = FMT_FAIL_LONG_COMPAT_id;
+	bpf_map_update_elem(insn_fmt_fd, &key, &FMT_FAIL_LONG_COMPAT, BPF_ANY);
+	key = FMT_SUCC_LONG_COMPAT_id;
+	bpf_map_update_elem(insn_fmt_fd, &key, &FMT_SUCC_LONG_COMPAT, BPF_ANY);
+	key = FMT_FAIL_INT_COMPAT_id;
+	bpf_map_update_elem(insn_fmt_fd, &key, &FMT_FAIL_INT_COMPAT, BPF_ANY);
+	key = FMT_SUCC_INT_COMPAT_id;
+	bpf_map_update_elem(insn_fmt_fd, &key, &FMT_SUCC_INT_COMPAT, BPF_ANY);
+
+	func_names_fd = bpf_map__fd(skel->maps.func_names);
+	if (func_names_fd <= 0) {
+		fprintf(stderr, "Failed to open map func_names\n");
+		return -1;
+	}
+	func_ips_fd = bpf_map__fd(skel->maps.func_ips);
+	if (func_ips_fd <= 0) {
+		fprintf(stderr, "Failed to open map func_ips\n");
+		return -1;
+	}
+	func_flags_fd = bpf_map__fd(skel->maps.func_flags);
+	if (func_flags_fd <= 0) {
+		fprintf(stderr, "Failed to open map func_flags\n");
+		return -1;
+	}
+	for (int i = 0; i < n; i++) {
+		const struct mass_attacher_func_info *finfo;
+		const struct glob *glob;
+		__u32 flags;
+
+		finfo = mass_attacher__func(att, i);
+		flags = func_flags(finfo->name, vmlinux_btf, finfo->btf_id);
+
+		for (int j = 0; j < env.entry_glob_cnt; j++) {
+			glob = &env.entry_globs[j];
+			if (!full_glob_matches(glob->name, glob->mod, finfo->name, finfo->module))
+				continue;
+
+			flags |= FUNC_IS_ENTRY;
+
+			if (env.verbose)
+				printf("Function '%s' is marked as an entry point.\n", finfo->name);
+
+			break;
+		}
+
+		key = i;
+		memset(name, 0, MAX_FUNC_NAME_LEN);
+		strncpy(name, finfo->name, MAX_FUNC_NAME_LEN - 1);
+		name[MAX_FUNC_NAME_LEN - 1] = '\0';
+		bpf_map_update_elem(func_names_fd, &key, name, BPF_ANY);
+		//strncpy(skel->bss->func_names[i], finfo->name, MAX_FUNC_NAME_LEN - 1);
+		//skel->bss->func_names[i][MAX_FUNC_NAME_LEN - 1] = '\0';
+
+		key = i;
+		val = finfo->addr;
+		bpf_map_update_elem(func_ips_fd, &key, &val, BPF_ANY);
+		//skel->bss->func_ips[i] = finfo->addr;
+
+		key = i;
+		val = flags;
+		bpf_map_update_elem(func_flags_fd, &key, &val, BPF_ANY);
+		//skel->bss->func_flags[i] = flags;
+	}
+
+	mass_attacher_update_global_var(att);
+
+	return 0;
+}
+#endif
 int main(int argc, char **argv)
 {
 	long page_size = sysconf(_SC_PAGESIZE);
@@ -2012,7 +2408,11 @@ int main(int argc, char **argv)
 	}
 
 	/* Open BPF skeleton */
+#ifndef BPF_NO_GLOBAL_DATA
 	env.ctx.skel = skel = retsnoop_bpf__open();
+#else
+	env.ctx.skel = skel = retsnoop_bpf__open_opts(&opts_prog);
+#endif
 	if (!skel) {
 		fprintf(stderr, "Failed to open BPF skeleton.\n");
 		err = -EINVAL;
@@ -2021,20 +2421,25 @@ int main(int argc, char **argv)
 
 	bpf_map__set_max_entries(skel->maps.stacks, env.stacks_map_sz);
 
+#ifndef BPF_NO_GLOBAL_DATA
 	skel->rodata->tgid_allow_cnt = env.allow_pid_cnt;
 	skel->rodata->tgid_deny_cnt = env.deny_pid_cnt;
+#endif
 	if (env.allow_pid_cnt + env.deny_pid_cnt > 0) {
 		bpf_map__set_max_entries(skel->maps.tgids_filter,
 					 env.allow_pid_cnt + env.deny_pid_cnt);
 	}
 
+#ifndef BPF_NO_GLOBAL_DATA
 	skel->rodata->comm_allow_cnt = env.allow_comm_cnt;
 	skel->rodata->comm_deny_cnt = env.deny_comm_cnt;
+#endif
 	if (env.allow_comm_cnt + env.deny_comm_cnt > 0) {
 		bpf_map__set_max_entries(skel->maps.comms_filter,
 					 env.allow_comm_cnt + env.deny_comm_cnt);
 	}
 
+#ifndef BPF_NO_GLOBAL_DATA
 	/* turn on extra bpf_printk()'s on BPF side */
 	skel->rodata->verbose = env.bpf_logs;
 	skel->rodata->extra_verbose = env.debug_extra;
@@ -2046,6 +2451,7 @@ int main(int argc, char **argv)
 	memset(skel->rodata->spaces, ' ', sizeof(skel->rodata->spaces) - 1);
 
 	skel->rodata->use_ringbuf = env.has_ringbuf;
+#endif
 	if (env.has_ringbuf) {
 		bpf_map__set_type(skel->maps.rb, BPF_MAP_TYPE_RINGBUF);
 		bpf_map__set_key_size(skel->maps.rb, 0);
@@ -2079,12 +2485,16 @@ int main(int argc, char **argv)
 		}
 	}
 	env.use_lbr = env.use_lbr && env.has_lbr && env.has_branch_snapshot;
+#ifndef BPF_NO_GLOBAL_DATA
 	skel->rodata->use_lbr = env.use_lbr;
+#endif
 	if (env.use_lbr && env.verbose)
 		printf("LBR capture enabled.\n");
 
 	if (env.emit_func_trace) {
+#ifndef BPF_NO_GLOBAL_DATA
 		skel->rodata->emit_func_trace = true;
+#endif
 
 		err = init_func_traces();
 		if (err) {
@@ -2176,10 +2586,12 @@ int main(int argc, char **argv)
 			break;
 		}
 
+#ifndef BPF_NO_GLOBAL_DATA
 		strncpy(skel->bss->func_names[i], finfo->name, MAX_FUNC_NAME_LEN - 1);
 		skel->bss->func_names[i][MAX_FUNC_NAME_LEN - 1] = '\0';
 		skel->bss->func_ips[i] = finfo->addr;
 		skel->bss->func_flags[i] = flags;
+#endif
 	}
 
 	for (i = 0; i < env.entry_glob_cnt; i++) {
@@ -2212,6 +2624,10 @@ int main(int argc, char **argv)
 	if (err)
 		goto cleanup;
 
+#ifdef BPF_NO_GLOBAL_DATA
+	if (update_global_map(skel, att))
+		goto cleanup;
+#endif
 	for (i = 0; i < env.allow_pid_cnt; i++) {
 		int tgid = env.allow_pids[i];
 		bool verdict = true; /* allowed */

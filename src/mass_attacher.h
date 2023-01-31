@@ -61,6 +61,9 @@ int mass_attacher__prepare(struct mass_attacher *att);
 int mass_attacher__load(struct mass_attacher *att);
 int mass_attacher__attach(struct mass_attacher *att);
 void mass_attacher__activate(struct mass_attacher *att);
+#ifdef BPF_NO_GLOBAL_DATA
+void mass_attacher_update_global_var(struct mass_attacher *att);
+#endif
 
 size_t mass_attacher__func_cnt(const struct mass_attacher *att);
 const struct mass_attacher_func_info * mass_attacher__func(const struct mass_attacher *att, int id);

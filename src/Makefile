@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: BSD-2-Clause
-OUTPUT := .output
+OUTPUT := $(abspath .output)
 CLANG ?= clang
 LD ?= ld
 LLVM_STRIP ?= llvm-strip
 CARGO ?= cargo
 DEBUG ?=
+G ?= 0
 
 BPFTOOL_SRC := $(abspath ../bpftool/src)
 BPFTOOL_OUTPUT ?= $(abspath $(OUTPUT)/bpftool)
@@ -18,6 +19,20 @@ SIDECAR := ../sidecar/target/$(if $(DEBUG),debug,release)/addr2line
 # outdated
 INCLUDES := -I$(OUTPUT) -I../libbpf/include/uapi
 CFLAGS ?= -g -Wall -O$(if $(DEBUG),0,2)
+EXTRA_CFLAGS ?= -g -O$(if $(DEBUG),0,2)
+BPF_CFLAGS ?=
+
+ifeq ($(G),0)
+	CFLAGS += -DBPF_NO_GLOBAL_DATA
+endif
+
+ifeq ($(G),0)
+	EXTRA_CFLAGS += -DBPF_NO_GLOBAL_DATA
+endif
+
+ifeq ($(G),0)
+	BPF_CFLAGS += -DBPF_NO_GLOBAL_DATA
+endif
 
 ARCH ?= $(shell uname -m						\
 		| sed 's/x86_64/x86/'					\
@@ -89,7 +104,7 @@ $(LIBBPF_OBJ): $(wildcard $(LIBBPF_SRC)/*.[ch] $(LIBBPF_SRC)/Makefile) | $(OUTPU
 	$(Q)$(MAKE) -C $(LIBBPF_SRC) BUILD_STATIC_ONLY=1		      \
 		    OBJDIR=$(dir $@)/libbpf DESTDIR=$(dir $@)		      \
 		    INCLUDEDIR= LIBDIR= UAPIDIR=			      \
-		    EXTRA_CFLAGS="-g -O$(if $(DEBUG),0,2)" \
+		    EXTRA_CFLAGS="$(EXTRA_CFLAGS)" \
 		    install
 
 # Build bpftool
@@ -108,6 +123,7 @@ $(OUTPUT)/%.bpf.o: %.bpf.c $(LIBBPF_OBJ) $(wildcard *.h) $(ARCH)/vmlinux.h    \
 		 | $(OUTPUT) $(OUTPUT)/tests
 	$(call msg,BPF,$@)
 	$(Q)$(CLANG) -g -O2 -target bpf -D__TARGET_ARCH_$(ARCH) -I$(ARCH)     \
+		     $(BPF_CFLAGS) \
 		     $(INCLUDES) $(CLANG_BPF_SYS_INCLUDES) -c $(filter %.c,$^) -o $@
 
 # Link together BPF object files and generate BPF skeleton
@@ -122,7 +138,9 @@ $(OUTPUT)/%.o: %.c $(wildcard *.h) | $(OUTPUT) $(OUTPUT)/tests
 	$(call msg,CC,$@)
 	$(Q)$(CC) $(CFLAGS) $(INCLUDES) -c $(filter %.c,$^) -o $@
 
+ifeq ($(G),1)
 $(OUTPUT)/retsnoop.skel.h: $(OUTPUT)/mass_attach.bpf.o
+endif
 $(OUTPUT)/retsnoop.o: $(OUTPUT)/retsnoop.skel.h $(OUTPUT)/calib_feat.skel.h
 $(OUTPUT)/mass_attacher.o: $(OUTPUT)/retsnoop.skel.h $(OUTPUT)/calib_feat.skel.h
 
